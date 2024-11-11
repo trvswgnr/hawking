@@ -8,13 +8,21 @@ import { filesize } from "filesize";
 import ora, { type Ora } from "ora";
 import readline from "readline";
 
+// store active spinner for cleanup
+let activeSpinner: Ora | null = null;
+
+main().catch((error) => {
+  console.error("\nAn unexpected error occurred:", error);
+  cleanup();
+  process.exit(1);
+});
+
 interface ProjectInfo {
   path: string;
+  nice_path: string;
   size: number;
+  type: "node" | "rust";
 }
-
-// Store active spinner for cleanup
-let activeSpinner: Ora | null = null;
 
 // make sure cursor is visible
 function showCursor() {
@@ -44,7 +52,16 @@ async function getDirectorySize(dirPath: string): Promise<number> {
   return size;
 }
 
-async function findNodeModules(
+async function isRustProject(dirPath: string): Promise<boolean> {
+  try {
+    const files = await fs.readdir(dirPath);
+    return files.includes("Cargo.toml");
+  } catch {
+    return false;
+  }
+}
+
+async function findBuildDirectories(
   startPath: string,
   results: ProjectInfo[] = []
 ): Promise<ProjectInfo[]> {
@@ -55,14 +72,36 @@ async function findNodeModules(
       const fullPath = path.join(startPath, file.name);
 
       if (file.isDirectory()) {
+        // check for node_modules
         if (file.name === "node_modules") {
           const size = await getDirectorySize(fullPath);
           results.push({
             path: path.dirname(fullPath),
+            nice_path: path.dirname(fullPath).replace(getHomeDirectory(), "~"),
             size,
+            type: "node",
           });
-        } else if (!file.name.startsWith(".") && file.name !== "node_modules") {
-          await findNodeModules(fullPath, results);
+        }
+        // check for rust target directory
+        else if (
+          file.name === "target" &&
+          (await isRustProject(path.dirname(fullPath)))
+        ) {
+          const size = await getDirectorySize(fullPath);
+          results.push({
+            path: path.dirname(fullPath),
+            nice_path: path.dirname(fullPath).replace(getHomeDirectory(), "~"),
+            size,
+            type: "rust",
+          });
+        }
+        // continue searching if not a special directory
+        else if (
+          !file.name.startsWith(".") &&
+          file.name !== "node_modules" &&
+          file.name !== "target"
+        ) {
+          await findBuildDirectories(fullPath, results);
         }
       }
     }
@@ -73,9 +112,15 @@ async function findNodeModules(
   return results;
 }
 
-async function deleteNodeModules(projectPath: string): Promise<void> {
-  const nodeModulesPath = path.join(projectPath, "node_modules");
-  await fs.rm(nodeModulesPath, { recursive: true, force: true });
+async function deleteBuildDirectory(
+  projectPath: string,
+  type: "node" | "rust"
+): Promise<void> {
+  const dirPath = path.join(
+    projectPath,
+    type === "node" ? "node_modules" : "target"
+  );
+  await fs.rm(dirPath, { recursive: true, force: true });
 }
 
 function cleanup() {
@@ -88,11 +133,10 @@ function cleanup() {
 
 function handleExit() {
   cleanup();
-  console.log("\n"); // Add a newline for cleaner output
+  console.log("\n"); // add a newline for cleaner output
   process.exit(0);
 }
 
-// Handle various exit signals
 function setupCleanup() {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -103,7 +147,7 @@ function setupCleanup() {
     handleExit();
   });
 
-  // Close readline interface
+  // close readline interface
   rl.close();
 
   const signals = ["SIGTERM", "SIGQUIT", "beforeExit", "exit"];
@@ -111,7 +155,7 @@ function setupCleanup() {
     process.on(signal, handleExit);
   });
 
-  // Handle uncaught errors
+  // handle uncaught errors
   process.on("uncaughtException", (error) => {
     console.error("\nAn unexpected error occurred:", error);
     handleExit();
@@ -119,36 +163,35 @@ function setupCleanup() {
 }
 
 async function main() {
-  // make sure cursor is shown on startup
   showCursor();
-
   setupCleanup();
 
-  console.log(chalk.blue.bold("\n🧹 Node Modules Cleaner\n"));
+  console.log(chalk.blue.bold("\n🧹 Project Build Directory Cleaner\n"));
+  console.log(
+    chalk.gray("Supports Node.js (node_modules) and Rust (target) projects\n")
+  );
 
   activeSpinner = ora({
-    text: "Searching for node_modules directories...",
+    text: "Searching for build directories...",
     hideCursor: true,
   }).start();
 
-  const projects = await findNodeModules(process.cwd());
+  const projects = await findBuildDirectories(process.cwd());
 
   activeSpinner.stop();
   activeSpinner = null;
-
-  // make sure cursor is shown after spinner
   showCursor();
 
   if (projects.length === 0) {
-    console.log(chalk.yellow("\nNo node_modules directories found."));
+    console.log(chalk.yellow("\nNo build directories found."));
     return;
   }
 
   const choices = projects.map((project) => ({
-    name: `${chalk.green(project.path)} ${chalk.gray(
+    name: `${chalk.green(project.nice_path)} ${chalk.gray(
       `(${filesize(project.size)})`
-    )}`,
-    value: project.path,
+    )} ${chalk.yellow(`[${project.type}]`)}`,
+    value: project,
   }));
 
   try {
@@ -172,7 +215,7 @@ async function main() {
         type: "confirm",
         name: "confirm",
         message: chalk.red(
-          "Are you sure you want to delete the selected node_modules directories?"
+          "Are you sure you want to delete the selected build directories?"
         ),
         default: false,
       },
@@ -184,17 +227,19 @@ async function main() {
     }
 
     activeSpinner = ora({
-      text: "Deleting selected node_modules...",
+      text: "Deleting selected build directories...",
       hideCursor: true,
     }).start();
 
     try {
-      await Promise.all(selectedProjects.map(deleteNodeModules));
-      activeSpinner.succeed(
-        "Successfully deleted selected node_modules directories."
+      await Promise.all(
+        selectedProjects.map((project: ProjectInfo) =>
+          deleteBuildDirectory(project.path, project.type)
+        )
       );
+      activeSpinner.succeed("Successfully deleted selected build directories.");
     } catch (error) {
-      activeSpinner.fail("Error deleting node_modules directories:");
+      activeSpinner.fail("Error deleting build directories:");
       console.error(error);
     }
   } catch (e) {
@@ -210,8 +255,6 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error("\nAn unexpected error occurred:", error);
-  cleanup();
-  process.exit(1);
-});
+function getHomeDirectory() {
+  return process.env.HOME || process.env.USERPROFILE || "";
+}
