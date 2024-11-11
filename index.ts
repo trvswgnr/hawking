@@ -215,7 +215,7 @@ async function main() {
         type: "confirm",
         name: "confirm",
         message: chalk.red(
-          "Are you sure you want to delete the selected build directories?"
+          `Are you sure you want to delete ${selectedProjects.length} directories?`
         ),
         default: false,
       },
